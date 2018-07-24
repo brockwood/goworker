@@ -3,6 +3,7 @@ package goworker
 import (
 	"crypto/x509"
 	"fmt"
+	"log"
 	"os"
 	"reflect"
 	"testing"
@@ -11,6 +12,48 @@ import (
 	"github.com/kabukky/httpscerts"
 	"github.com/ory/dockertest"
 )
+
+var testRedisPort string
+
+func TestMain(m *testing.M) {
+	httpscerts.Generate("cert.pem", "key.pem", "localhost")
+	wd, _ := os.Getwd()
+	options := &dockertest.RunOptions{
+		Repository: "madflojo/redis-tls",
+		Tag:        "latest",
+		Mounts:     []string{fmt.Sprintf("%s:/certs", wd)},
+	}
+	pool, err := dockertest.NewPool("")
+	if err != nil {
+		removeTLSFiles()
+		log.Fatal(err)
+	}
+	resource, err := pool.RunWithOptions(options)
+	if err != nil {
+		removeTLSFiles()
+		log.Fatal(err)
+	}
+	if err = pool.Retry(func() error {
+		var dialOptions []redis.DialOption
+		dialOptions = append(dialOptions, redis.DialUseTLS(true))
+		dialOptions = append(dialOptions, redis.DialTLSSkipVerify(true))
+		conn, dialerr := redis.Dial("tcp", fmt.Sprintf("localhost:%s", resource.GetPort("6379/tcp")), dialOptions...)
+		if dialerr != nil {
+			return dialerr
+		}
+		conn.Close()
+		return nil
+	}); err != nil {
+		pool.Purge(resource)
+		removeTLSFiles()
+		log.Fatal("Error waiting for Docker image to start.")
+	}
+	testRedisPort = resource.GetPort("6379/tcp")
+	code := m.Run()
+	pool.Purge(resource)
+	removeTLSFiles()
+	os.Exit(code)
+}
 
 func TestRedisTLSIgnoreCertCheck(t *testing.T) {
 	manageTLSSetup(t, true)
@@ -21,8 +64,6 @@ func TestRedisTLSEnforceCertCheck(t *testing.T) {
 }
 
 func manageTLSSetup(t *testing.T, skipTLS bool) {
-	teardownRedis, redisPort := setupRedisContainer(t)
-	defer teardownRedis(t)
 	expectedArgs := []interface{}{"my", "word", "is", "my", "bond"}
 	jobName := "Worker::Queue"
 	queueName := "testqueue"
@@ -34,7 +75,7 @@ func manageTLSSetup(t *testing.T, skipTLS bool) {
 		},
 	}
 	settings := WorkerSettings{
-		URI:            fmt.Sprintf("rediss://localhost:%s", redisPort),
+		URI:            fmt.Sprintf("rediss://localhost:%s", testRedisPort),
 		ExitOnComplete: true,
 		Queues:         []string{queueName},
 		SkipTLSVerify:  skipTLS,
@@ -70,11 +111,9 @@ func manageTLSSetup(t *testing.T, skipTLS bool) {
 }
 
 func TestRedisTLSCertCheck(t *testing.T) {
-	teardownRedis, redisPort := setupRedisContainer(t)
-	defer teardownRedis(t)
 	expectedJob := &Job{}
 	settings := WorkerSettings{
-		URI:            fmt.Sprintf("rediss://localhost:%s", redisPort),
+		URI:            fmt.Sprintf("rediss://localhost:%s", testRedisPort),
 		ExitOnComplete: true,
 		SkipTLSVerify:  false,
 		Queues:         []string{"testqueue"},
@@ -89,48 +128,6 @@ func TestRedisTLSCertCheck(t *testing.T) {
 	if _, ok := err.(x509.UnknownAuthorityError); !ok {
 		t.Errorf("Expected an x509 error but received %s", err)
 	}
-}
-
-func setupRedisContainer(t *testing.T) (func(t *testing.T), string) {
-	httpscerts.Generate("cert.pem", "key.pem", "localhost")
-	wd, _ := os.Getwd()
-	options := &dockertest.RunOptions{
-		Repository: "madflojo/redis-tls",
-		Tag:        "latest",
-		Mounts:     []string{fmt.Sprintf("%s:/certs", wd)},
-	}
-	pool, err := dockertest.NewPool("")
-	if err != nil {
-		removeTLSFiles()
-		t.Log(err.Error())
-		t.FailNow()
-	}
-	resource, err := pool.RunWithOptions(options)
-	if err != nil {
-		removeTLSFiles()
-		t.Log(err.Error())
-		t.FailNow()
-	}
-	if err = pool.Retry(func() error {
-		var dialOptions []redis.DialOption
-		dialOptions = append(dialOptions, redis.DialUseTLS(true))
-		dialOptions = append(dialOptions, redis.DialTLSSkipVerify(true))
-		conn, dialerr := redis.Dial("tcp", fmt.Sprintf("localhost:%s", resource.GetPort("6379/tcp")), dialOptions...)
-		if dialerr != nil {
-			return dialerr
-		}
-		conn.Close()
-		return nil
-	}); err != nil {
-		t.Log("Error waiting for Docker image to start.")
-		pool.Purge(resource)
-		removeTLSFiles()
-		t.FailNow()
-	}
-	return func(t *testing.T) {
-		pool.Purge(resource)
-		removeTLSFiles()
-	}, resource.GetPort("6379/tcp")
 }
 
 func removeTLSFiles() {
